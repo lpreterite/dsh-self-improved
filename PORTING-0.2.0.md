@@ -91,3 +91,33 @@ dsh plugin --profile web add /vol2/1000/Works/github/dsh-self-improved
 ```
 
 注意：安装写入 `~/.dsh/profiles/web/`，在本会话沙箱外，需提权执行。
+
+## 回归验证记录（2026-10-22 晚，宿主 0.2.0-rc.2 运行中实测）
+
+移植提交 c5d9cae 在真实宿主（`dsh web` 127.0.0.1:3080，插件经 dsh.bundle 自动挂载 + profile patch id 定向覆盖）上的全面回归，全部通过：
+
+- **构建**：`npm run build` 0 错误；重建产物与运行中实例的 `lib/` 逐字节一致。
+- **端点正向**：`GET /browser` 200（快照完整）、`GET /config` 200（descriptor 四件套齐全，
+  `blankApiKey` 置空生效）、`POST /action {op:detail}` 200（返回完整记忆 + 快照）。
+- **端点负向**：`GET /action`→405；`POST /config` 非 ops body→400；坏 JSON→400；
+  **过期 expectedRevision→409**（SettingsConflictError 文案正确，且未落任何变更）。
+- **volatile 热更新**：`POST /config` 把 `debug` false→true：revision 0→1，宿主日志出现
+  `runtime config applied (volatile-update)`，定时器随热应用同步重挂（nightly review re-arm 日志可见）；
+  改回 false 后配置值与初始完全一致（revision 单调递增，符合预期）。
+- **headless 浏览器 E2E**：设置面板 → 本插件分区（标签 "Evolving Memory"，order 27）：
+  配置标签页 213 个 `__dsi_*` 节点正常渲染（分组/复选框/下拉/Save/Reset 齐全）；
+  记忆标签页 **135 行真实记忆**渲染正常（类型徽章/星级/操作按钮），Detail 交互正常；
+  截图目检无布局错乱、无报错。此前移植时（300 条记忆）的结论复现成立。
+- **记忆管线活跃性**：L0 `~/.dsh/memory/conversations/*.jsonl` 实时写入；
+  E2E 进行期间 L0→L1 把验证会话**实时**提取为新记忆（最新记忆 createdAt 与验证时刻一致）——
+  管线在回归过程中自证存活。
+- **双实例/挂载**：宿主日志无 duplicate/EADDR/conflict；profile patch 对本插件是
+  id 定向 config 覆盖（recall.strategy=hybrid + bge-m3 embedding），与 bundle 自动挂载正确叠合，单实例。
+- **未覆盖（有意）**：`forget/correct/deleteSkill` 三个破坏性 op 不在真实数据上执行
+  （实现已代码级复核，移植时 E2E 已覆盖）；403 访问栅栏无法从宿主本机触发
+  （loopback 恒放行），`isLoopbackRequest`/remoteWebUiPairing 逻辑代码级确认在位。
+
+E2E 方法备注（可复跑）：宿主无 playwright 库，用 playwright 缓存的
+`chromium_headless_shell` + 原生 CDP（Node 22 内置 WebSocket/fetch，零新依赖）驱动；
+设置面板入口为 `aria-label="Settings"` 按钮，插件分区靠 `settings.section` 槽位注入、
+DOM 标记为 `__dsi_*` 类名。
