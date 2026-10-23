@@ -111,7 +111,7 @@ export interface Config {
   /** M4 自进化参数 */
   evolve: {
     decay: { enabled: boolean; minAgeDays: number; threshold: number; retentionDays: number; maxActiveMemories: number };
-    skillSynthesis: { enabled: boolean; minImportance: number; skillsRoot: string; prefix: string; maxSkills: number };
+    skillSynthesis: { enabled: boolean; minImportance: number; skillsRoot: string; prefix: string; maxSkills: number; dedupe: boolean };
   };
   /** M6 成长治理：画像版本/场景/对话切片的上限与清理 */
   housekeeping: {
@@ -189,6 +189,8 @@ export const Config = z.object({
       skillsRoot: z.string().default(""),
       prefix: z.string().default("dsi-"),
       maxSkills: z.number().min(0).default(100),
+      /** 写入前查重（SKIP/UPDATE/NEW 三态），关闭则撞名回退"已存在不覆盖"；任何配置下不再 fork 同名副本 */
+      dedupe: z.boolean().default(true),
     }),
   }).volatile(),
   housekeeping: z.object({
@@ -365,6 +367,7 @@ export function apply(ctx: Context, rawConfig: Config): void {
             skillsRoot: config.evolve.skillSynthesis.skillsRoot,
             prefix: config.evolve.skillSynthesis.prefix,
             maxSkills: config.evolve.skillSynthesis.maxSkills,
+            dedupe: config.evolve.skillSynthesis.dedupe,
           },
           config.evolve.skillSynthesis.skillsRoot,
         )
