@@ -214,7 +214,7 @@ function renderPrompt(slices: ConversationSliceRecord[], maxChars: number): stri
 }
 
 /** 从模型文本中尽量提取 JSON（容忍代码块包裹/前后杂讯） */
-function extractJson(text: string): unknown | null {
+export function extractJson(text: string): unknown | null {
   const trimmed = text.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   const candidate = (fenced ? fenced[1] : trimmed).trim();

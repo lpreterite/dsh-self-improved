@@ -26,8 +26,9 @@ import { Extractor, type ExtractSettings } from "./extract.js";
 import { RecallService, createOpenAiEmbedding, type RecallSettings } from "./recall.js";
 import { installRecallInjection } from "./inject.js";
 import { Consolidator } from "./consolidate.js";
-import { applyDecay, synthesizeSkills, deleteSkill } from "./evolve.js";
+import { applyDecay, synthesizeSkills, deleteSkill, auditSkills, applySkillMerge, loadAuditPlan, persistDebug } from "./evolve.js";
 import { installMemoryCommands, browserSnapshot } from "./commands.js";
+import { readFileSync } from "node:fs";
 import { BlockAssembler, createUserMessage } from "@deepseek-ai/dsh-llm";
 
 export const name = "self-improved";
@@ -338,6 +339,52 @@ export function apply(ctx: Context, rawConfig: Config): void {
     embeddingProvider,
   );
   const skillLlm = makeLlmCall("memory-skill", 3000);
+  // P1（issue #1）：技能审计/合并的后台执行体（/memory skills-audit、skills-merge --apply）。
+  // 注入的 promise 永不 reject：失败也落盘 skills-debug/，命令侧只管触发。
+  const skillJob = { running: false };
+  const skillSynthesisSettings = () => ({ ...config.evolve.skillSynthesis });
+  const runSkillsAudit = async (): Promise<string> => {
+    if (skillJob.running) return "上一次技能审计仍在进行中，请稍后再试";
+    skillJob.running = true;
+    try {
+      const s = skillSynthesisSettings();
+      const { report } = await auditSkills(store, async ({ system, user, signal }) => skillLlm({ system, user, signal }), s, s.skillsRoot);
+      return report;
+    } catch (e) {
+      const msg = `技能审计失败：${String(e)}`;
+      console.warn("[dsh-self-improved]", msg);
+      persistDebug(store, "skills-audit-report-latest.txt", `${msg}\n（详见宿主日志）`);
+      return msg;
+    } finally {
+      skillJob.running = false;
+    }
+  };
+  const runSkillsMerge = async (planFile?: string): Promise<string> => {
+    if (skillJob.running) return "上一次技能审计/合并仍在进行中，请稍后再试";
+    skillJob.running = true;
+    try {
+      const s = skillSynthesisSettings();
+      let plan = null;
+      if (planFile) {
+        try {
+          plan = JSON.parse(readFileSync(planFile, "utf8"));
+        } catch {
+          return `计划文件不可读：${planFile}`;
+        }
+      } else {
+        plan = loadAuditPlan(store);
+      }
+      if (!plan) return "尚无审计计划：先执行 /memory skills-audit";
+      return await applySkillMerge(store, async ({ system, user, signal }) => skillLlm({ system, user, signal }), plan, s, s.skillsRoot);
+    } catch (e) {
+      const msg = `技能合并失败：${String(e)}`;
+      console.warn("[dsh-self-improved]", msg);
+      persistDebug(store, "skills-merge-result-latest.txt", `${msg}\n（详见宿主日志）`);
+      return msg;
+    } finally {
+      skillJob.running = false;
+    }
+  };
   let lastEvolveTs = 0;
   /**
    * 进化一轮。
@@ -545,7 +592,12 @@ export function apply(ctx: Context, rawConfig: Config): void {
       return;
     }
     if (commandsDispose) return;
-    commandsDispose = installMemoryCommands(ctx, store, { evolve: () => fullReview("manual"), isEnabled: () => state.enabled });
+    commandsDispose = installMemoryCommands(ctx, store, {
+      evolve: () => fullReview("manual"),
+      skillsAudit: () => runSkillsAudit(),
+      skillsMergeApply: (planFile?: string) => runSkillsMerge(planFile),
+      isEnabled: () => state.enabled,
+    });
     if (commandsDispose) {
       log("memory command installed (/memory)");
     } else {

@@ -3,9 +3,9 @@
  * 处理器为纯函数，便于单元测试；installMemoryCommands 仅在宿主提供 commands 服务时注册。
  */
 import type { Context } from "@deepseek-ai/cordis";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { defaultSkillsDir } from "./evolve.js";
+import { defaultSkillsDir, loadAuditPlan } from "./evolve.js";
 import type { MemoryStore } from "./storage.js";
 
 export interface CommandOutcome {
@@ -24,7 +24,14 @@ function err(text: string): CommandOutcome {
 export function handleMemoryCommand(
   store: MemoryStore,
   rawInput: string,
-  opts?: { evolve?: () => Promise<Record<string, unknown>> },
+  opts?: {
+    evolve?: () => Promise<Record<string, unknown>>;
+    /** P1：技能库审计（LLM 聚类，后台执行，结果落 skills-debug/；实现内自行兜底不 reject） */
+    skillsAudit?: () => Promise<string>;
+    /** P1：执行合并计划（--apply 时调用；后台执行，结果落 skills-debug/） */
+    skillsMergeApply?: (planFile?: string) => Promise<string>;
+    isEnabled?: () => boolean;
+  },
 ): CommandOutcome {
   const args = rawInput.trim().split(/\s+/).filter(Boolean);
   const json = args.includes("--json");
@@ -38,6 +45,33 @@ export function handleMemoryCommand(
       const p = opts.evolve();
       if (json) return ok(JSON.stringify({ kind: "success", text: "进化已触发", value: {} }));
       return ok("进化已触发，后台执行中（巩固/衰减/技能/治理）…");
+    }
+    // ---- P1（issue #1）：技能库审计 / 报告 / 合并 ----
+    case "skills-audit": {
+      if (!opts?.skillsAudit) return err("技能审计未安装（需要 LLM 能力）");
+      const p = opts.skillsAudit();
+      if (json) return ok(JSON.stringify({ kind: "success", text: "技能审计已触发", value: {} }));
+      return ok("技能库审计已触发（LLM 聚类，不动任何文件），完成后 /memory skills-report 查看");
+    }
+    case "skills-report": {
+      return ok(renderSkillsReports(store));
+    }
+    case "skills-merge": {
+      const apply = args.includes("--apply");
+      if (apply) {
+        if (!opts?.skillsMergeApply) return err("技能合并未安装（需要 LLM 能力）");
+        const planFile = args.find((a) => a !== "--apply" && a !== "skills-merge");
+        const p = opts.skillsMergeApply(planFile);
+        if (json) return ok(JSON.stringify({ kind: "success", text: "合并已触发", value: {} }));
+        return ok("合并已触发（apply：就地更新保留者并删除副本，全部有备份），完成后 /memory skills-report 查看");
+      }
+      // 干跑（零 LLM）：只读最新计划，打印将要发生什么
+      const plan = loadAuditPlan(store);
+      if (!plan) return err("尚无审计计划：先执行 /memory skills-audit");
+      const lines = [`合并计划（dry，共 ${plan.clusters.length} 簇）：`];
+      for (const c of plan.clusters) lines.push(`- [${c.keeper}] ← 删除 ${c.duplicates.join("、")}（${c.reason}）`);
+      lines.push("确认无误后执行 /memory skills-merge --apply。");
+      return ok(lines.join("\n"));
     }
     case "search": {
       const q = args.slice(1).join(" ");
@@ -86,9 +120,29 @@ export function handleMemoryCommand(
           "/memory browser --json\n" +
           "/memory forget <id>\n" +
           "/memory correct <id> <新内容>\n" +
+          "/memory skills-audit（LLM 聚类重复技能，后台）\n" +
+          "/memory skills-report（查看最近审计/合并结果）\n" +
+          "/memory skills-merge（dry 预览合并计划）\n" +
+          "/memory skills-merge --apply（执行合并，有备份）\n" +
           "/memory status",
       );
   }
+}
+
+/** 拼装最近的审计报告与合并结果（都没有时给引导文案） */
+function renderSkillsReports(store: MemoryStore): string {
+  const dbg = join(store.dir, "skills-debug");
+  const parts: string[] = [];
+  for (const [title, file] of [
+    ["最近审计报告", "skills-audit-report-latest.txt"],
+    ["最近合并结果", "skills-merge-result-latest.txt"],
+  ] as const) {
+    try {
+      const file2 = join(dbg, file);
+      if (existsSync(file2)) parts.push(`==== ${title} ====\n${readFileSync(file2, "utf8").trim()}`);
+    } catch { /* 忽略单个文件读取失败 */ }
+  }
+  return parts.length > 0 ? parts.join("\n\n") : "尚无审计/合并报告：先执行 /memory skills-audit。";
 }
 
 /** 记忆浏览器快照（设置页前端用；content 截断 + 数量上限控制体积） */
@@ -170,17 +224,22 @@ export function listSkills(limit = 100): Array<{
 export function installMemoryCommands(
   ctx: Context,
   store: MemoryStore,
-  opts?: { evolve?: () => Promise<Record<string, unknown>>; isEnabled?: () => boolean },
+  opts?: {
+    evolve?: () => Promise<Record<string, unknown>>;
+    skillsAudit?: () => Promise<string>;
+    skillsMergeApply?: (planFile?: string) => Promise<string>;
+    isEnabled?: () => boolean;
+  },
 ): (() => void) | null {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const commands = (ctx as any).get?.("commands");
   if (!commands) return null;
   return commands.register({
     name: "memory",
-    description: "管理 dsh-self-improved 记忆库（search/list/forget/correct/status/evolve）",
+    description: "管理 dsh-self-improved 记忆库（search/list/forget/correct/status/evolve/skills-audit）",
     // 关键：声明 input 后命令系统才会接管带参输入（如 /memory status），
     // 否则带参输入被判定为"命令不接受参数"而回落为普通消息发给 LLM。
-    input: { hint: "search <词> | list | status | forget <id> | correct <id> <内容> | evolve | browser" },
+    input: { hint: "search <词> | list | status | forget <id> | correct <id> <内容> | evolve | skills-audit | skills-merge | browser" },
     handler: async (invocation: { rawInput?: string }) => {
       // 兜底：即使注销存在时序窗口，关闭状态下也拒绝执行
       if (opts?.isEnabled && !opts.isEnabled()) {

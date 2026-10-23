@@ -7,11 +7,12 @@
  * P0 去重（issue #1）：写入前做存量技能查重（相似度预过滤 + 三态协议 SKIP/UPDATE/NEW），
  * 撞名永不 fork 副本——dedupe 开启走三态判定；关闭时同撞名回退 M4 原版"已存在不覆盖"。
  */
-import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, readFileSync, copyFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, readFileSync, copyFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import type { MemoryStore } from "./storage.js";
+import { extractJson } from "./extract.js";
 
 export interface DecaySettings {
   enabled: boolean;
@@ -159,7 +160,7 @@ function hashContent(text: string): string {
 const withTrailingNewline = (text: string): string => (text.endsWith("\n") ? text : text + "\n");
 
 /** 失败/拒绝产物落盘到 <store>/skills-debug/，便于排查（web 控制台日志用户看不到） */
-function persistDebug(store: MemoryStore, filename: string, content: string): void {
+export function persistDebug(store: MemoryStore, filename: string, content: string): void {
   try {
     mkdirSync(join(store.dir, "skills-debug"), { recursive: true });
     writeFileSync(join(store.dir, "skills-debug", filename), content, { encoding: "utf8" });
@@ -376,4 +377,233 @@ export async function synthesizeSkills(
 
 export function defaultSkillsDir(): string {
   return join(resolveDshHome(undefined, process.env), "skills");
+}
+
+// ==================== P1：存量技能审计与合并（issue #1） ====================
+
+/** 全量技能摘要（审计/合并用；body 不截断） */
+export interface FullSkillInfo extends SynthesizedSkillInfo {
+  body: string;
+  mtimeMs: number;
+}
+
+/** 读取存量技能全文（目录名带前缀；空 prefix = 全部技能目录），按名称排序保证稳定输出 */
+export function readSynthesizedSkillsFull(prefix: string, skillsRoot = ""): FullSkillInfo[] {
+  const root = skillsRoot.trim() || defaultSkillsDir();
+  try {
+    return readdirSync(root, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && d.name.startsWith(prefix))
+      .map((d): FullSkillInfo | null => {
+        try {
+          const file = join(root, d.name, "SKILL.md");
+          const raw = readFileSync(file, "utf8");
+          const fm = parseFrontmatter(raw);
+          return {
+            name: d.name,
+            description: fm.description ?? "",
+            whenToUse: fm.whenToUse ?? "",
+            bodyHead: (fm.body ?? raw).slice(0, 300),
+            body: (fm.body ?? raw).trim(),
+            mtimeMs: statSync(file).mtimeMs,
+          };
+        } catch {
+          return null;
+        }
+      })
+      .filter((x): x is FullSkillInfo => x !== null)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
+/** 退役信号统计：从记忆库扫 "invoked skill <name>" 事件（capture 入库），取每技能最近调用时间 */
+export function collectInvocationStats(store: MemoryStore): Map<string, number> {
+  const stats = new Map<string, number>();
+  try {
+    for (const m of store.listMemories({ limit: 2000 })) {
+      if (m.status !== "active") continue;
+      const match = m.content.match(/^invoked skill (\S+)$/);
+      if (!match) continue;
+      const prev = stats.get(match[1]) ?? 0;
+      if (m.createdAt > prev) stats.set(match[1], m.createdAt);
+    }
+  } catch { /* 记忆库不可用时按"从未调用"处理 */ }
+  return stats;
+}
+
+export const SKILL_AUDIT_SYSTEM_PROMPT = `你是技能库审计器。给定一组合成技能（name、description、whenToUse、正文）与其最近调用时间，找出主题重复的技能簇。
+规则：
+- 只把"同一经验域/同一 SOP 主题"的技能归为一簇；主题独立、各有侧重的不要硬凑成簇。
+- 每簇选一个保留者（keeper）：内容最完整、最近验证、命名最清晰者优先。
+- duplicates 里的技能之后会被删除，务必确认它们没有独立价值；uniqueNotes 摘录各副本独有的、值得并入保留者的细节要点（分号分隔，可为空字符串）。
+- 输出严格 JSON，不要额外文字：
+{"clusters":[{"keeper":"<name>","duplicates":["<name>"],"reason":"一句话","uniqueNotes":"要点；要点"}]}
+没有重复簇时输出 {"clusters":[]}。`;
+
+export interface SkillAuditCluster {
+  keeper: string;
+  duplicates: string[];
+  reason: string;
+  uniqueNotes: string;
+}
+
+export interface SkillAuditPlan {
+  createdAt: number;
+  skillsRoot: string;
+  clusters: SkillAuditCluster[];
+}
+
+function readSkillRaw(root: string, name: string): string | null {
+  try {
+    const file = join(root, name, "SKILL.md");
+    if (!existsSync(file)) return null;
+    return readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** 渲染人读审计报告 */
+function renderAuditReport(
+  skills: FullSkillInfo[],
+  invocations: Map<string, number>,
+  plan: SkillAuditPlan,
+): string {
+  const lines: string[] = [];
+  lines.push(`技能库审计 ${new Date(plan.createdAt).toLocaleString()} — 共 ${skills.length} 个技能`);
+  if (plan.clusters.length === 0) {
+    lines.push("未发现重复簇。");
+  } else {
+    lines.push(`发现 ${plan.clusters.length} 个重复簇：`);
+    for (const c of plan.clusters) {
+      lines.push(`- [${c.keeper}] ← 删除 ${c.duplicates.join("、")}（${c.reason}）`);
+      if (c.uniqueNotes) lines.push(`  独有细节待并入：${c.uniqueNotes}`);
+    }
+  }
+  const neverUsed = skills.filter((s) => !invocations.has(s.name)).map((s) => s.name);
+  if (neverUsed.length > 0) lines.push(`从未被调用的技能（N 天零调用，候选退役信号，仅提示不强删）：${neverUsed.join("、")}`);
+  lines.push("确认无误后执行 /memory skills-merge --apply 执行合并（保留者就地更新，删除者与旧版均有备份）。");
+  return lines.join("\n");
+}
+
+/** 技能库审计：全量读取 → LLM 聚类 → 校验簇合法性（名字必须真实存在、不得自删）→ 报告+计划落盘。不动任何技能文件。 */
+export async function auditSkills(
+  store: MemoryStore,
+  callLlm: EvolveCallLlm,
+  settings: SkillSynthesisSettings,
+  skillsRoot: string,
+): Promise<{ report: string; plan: SkillAuditPlan }> {
+  const root = skillsRoot.trim() || defaultSkillsDir();
+  const prefix = (settings.prefix ?? "").trim();
+  const skills = readSynthesizedSkillsFull(prefix, root);
+  if (skills.length === 0) {
+    const plan: SkillAuditPlan = { createdAt: Date.now(), skillsRoot: root, clusters: [] };
+    return { report: "技能目录为空，无需审计。", plan };
+  }
+  const invocations = collectInvocationStats(store);
+  const input = skills
+    .map((s) => {
+      const last = invocations.get(s.name);
+      return `### ${s.name}${last ? `（最近调用 ${new Date(last).toISOString().slice(0, 10)}）` : "（从未被调用）"}\ndescription: ${s.description}\nwhenToUse: ${s.whenToUse}\n正文：\n${s.body.slice(0, 600)}`;
+    })
+    .join("\n\n");
+  const signal = AbortSignal.timeout(180_000);
+  const text = (await callLlm({ system: SKILL_AUDIT_SYSTEM_PROMPT, user: input, signal })).trim();
+  const parsed = extractJson(text) as { clusters?: SkillAuditCluster[] } | null;
+  const known = new Set(skills.map((s) => s.name));
+  // 簇合法性校验：keeper 必须真实存在；duplicate 必须存在且 ≠ keeper；去重去空
+  const clusters = (Array.isArray(parsed?.clusters) ? parsed!.clusters : [])
+    .map((c) => ({
+      keeper: String(c?.keeper ?? "").trim(),
+      duplicates: Array.from(new Set((Array.isArray(c?.duplicates) ? c.duplicates : []).map((d) => String(d ?? "").trim()).filter(Boolean))),
+      reason: String(c?.reason ?? "").trim(),
+      uniqueNotes: String(c?.uniqueNotes ?? "").trim(),
+    }))
+    .filter((c) => known.has(c.keeper) && c.duplicates.length > 0 && c.duplicates.every((d) => known.has(d) && d !== c.keeper));
+  const plan: SkillAuditPlan = { createdAt: Date.now(), skillsRoot: root, clusters };
+  const report = renderAuditReport(skills, invocations, plan);
+  persistDebug(store, "skills-audit-latest.json", JSON.stringify(plan, null, 2));
+  persistDebug(store, "skills-audit-report-latest.txt", report);
+  return { report, plan };
+}
+
+/** 读取已落盘的最新审计计划（无则 null） */
+export function loadAuditPlan(store: MemoryStore): SkillAuditPlan | null {
+  try {
+    const file = join(store.dir, "skills-debug", "skills-audit-latest.json");
+    if (!existsSync(file)) return null;
+    const plan = JSON.parse(readFileSync(file, "utf8")) as SkillAuditPlan;
+    return Array.isArray(plan?.clusters) ? plan : null;
+  } catch {
+    return null;
+  }
+}
+
+export const SKILL_MERGE_SYSTEM_PROMPT = `你是技能合并器。把若干主题重复的技能合并为一个权威版本。
+- 以"保留者"为骨架，融入各"待合并删除"副本中独有的有效细节，删除彼此重复与已过时的内容。
+- 输出保留者的完整 Markdown（frontmatter 的 name 必须与保留者名完全一致），保持触发条件/操作步骤/注意事项/反例的结构。
+- 只输出这个 Markdown，不要额外文字。`;
+
+/** 执行合并计划：每簇一次 LLM 合并 → 校验产物 → 全量备份 → 覆盖保留者 → 删除副本。返回人读结果。 */
+export async function applySkillMerge(
+  store: MemoryStore,
+  callLlm: EvolveCallLlm,
+  plan: SkillAuditPlan,
+  settings: SkillSynthesisSettings,
+  skillsRoot: string,
+): Promise<string> {
+  const root = skillsRoot.trim() || defaultSkillsDir();
+  const prefix = (settings.prefix ?? "").trim();
+  const lines: string[] = [`技能合并（apply）${new Date().toLocaleString()}`];
+  if (!Array.isArray(plan?.clusters) || plan.clusters.length === 0) {
+    return "合并计划为空（先执行 /memory skills-audit）。";
+  }
+  const signal = AbortSignal.timeout(180_000);
+  for (const c of plan.clusters) {
+    if (!prefix || !c.keeper.startsWith(prefix)) {
+      lines.push(`- 跳过 ${c.keeper}：保留者不带合成前缀（${prefix || "未配置"}），拒绝操作`);
+      continue;
+    }
+    const keeperRaw = readSkillRaw(root, c.keeper);
+    if (keeperRaw === null) {
+      lines.push(`- 跳过 ${c.keeper}：SKILL.md 不存在`);
+      continue;
+    }
+    const dups = c.duplicates
+      .map((d) => ({ name: d, raw: readSkillRaw(root, d) }))
+      .filter((x): x is { name: string; raw: string } => x.raw !== null);
+    if (dups.length === 0) {
+      lines.push(`- 跳过 ${c.keeper}：副本均已不存在（可能已合并过）`);
+      continue;
+    }
+    const input = [
+      `### 保留者：${c.keeper}\n${keeperRaw}`,
+      ...dups.map((d) => `### 待合并删除：${d.name}${c.uniqueNotes ? `\n审计标注的独有细节：${c.uniqueNotes}` : ""}\n${d.raw}`),
+    ].join("\n\n");
+    let merged: string;
+    try {
+      merged = (await callLlm({ system: SKILL_MERGE_SYSTEM_PROMPT, user: input, signal })).trim();
+    } catch (e) {
+      lines.push(`- 失败 ${c.keeper}：合并 LLM 调用异常 ${String(e)}`);
+      continue;
+    }
+    const parsed = parseSkillMarkdown(merged);
+    if (!parsed?.name || parsed.name.toLowerCase() !== c.keeper.toLowerCase()) {
+      persistDebug(store, `merge-rejected-${c.keeper}-${Date.now()}.txt`, merged);
+      lines.push(`- 拒绝 ${c.keeper}：合并产物 name 不符或不可解析（原文落 skills-debug/）`);
+      continue;
+    }
+    const ts = Date.now();
+    for (const name of [c.keeper, ...dups.map((d) => d.name)]) {
+      const raw = readSkillRaw(root, name);
+      if (raw !== null) persistDebug(store, `backup-${name}-${ts}.md`, raw);
+    }
+    writeFileSync(join(root, c.keeper, "SKILL.md"), withTrailingNewline(merged), { encoding: "utf8" });
+    for (const d of dups) deleteSkill(d.name, root);
+    lines.push(`- ✅ ${c.keeper} ← 合并并删除 ${dups.map((d) => d.name).join("、")}（全部旧版有备份）`);
+  }
+  const out = lines.join("\n");
+  persistDebug(store, "skills-merge-result-latest.txt", out);
+  return out;
 }

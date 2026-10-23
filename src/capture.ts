@@ -33,6 +33,13 @@ export function installCapture(
     // 0.2.0：Session 不再暴露 events 字段，改用 snapshotEvents(fromSeq)（半开区间，fromSeq 含）。
     // 权威防重仍由 seq 水位保证：floor 之后（含）才是本轮新事件。
     for (const event of session.snapshotEvents(SessionLogOffset(floor === 0 ? 0 : floor + 1))) {
+      // P1 退役信号（issue #1）：技能调用注入（skill-invocation）是宿主上下文而非用户话语，
+      // 不入提取语料，仅记一条低重要度事件（低于合成 minImportance，衰减自然退役）。
+      const invokedSkill = skillInvocationName(event);
+      if (invokedSkill) {
+        store.insertMemory({ kind: "event", content: `invoked skill ${invokedSkill}`, importance: 3 });
+        continue;
+      }
       const slice = toSlice(session.id, event);
       if (slice) records.push(slice);
     }
@@ -47,6 +54,19 @@ export function installCapture(
       if (result instanceof Promise) await result;
     }
   });
+}
+
+/**
+ * user/message 事件若为技能调用注入（source.kind = "skill-invocation"），返回被调用的技能名；否则 null。
+ * 名字来自宿主 dsh-skill 的 SkillInvocationSource（注入边界已校验 user-invocable）。
+ */
+export function skillInvocationName(event: SessionEventLike): string | null {
+  if (event.type !== "user/message") return null;
+  const data = event.data as Record<string, unknown> | undefined;
+  const message = data?.message as Record<string, unknown> | undefined;
+  const src = (data?.source ?? message?.source) as { kind?: unknown; name?: unknown } | undefined;
+  if (!src || src.kind !== "skill-invocation") return null;
+  return typeof src.name === "string" && src.name.trim() ? src.name.trim() : null;
 }
 
 /** 把会话事件转成切片记录；非文本事件（如 turn/start、tool/call）返回 null */
